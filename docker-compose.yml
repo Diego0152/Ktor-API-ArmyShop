@@ -1,4 +1,25 @@
 services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ktor_api
+    restart: unless-stopped
+    depends_on:
+      mariadb:
+        condition: service_healthy
+    environment:
+      DB_URL: jdbc:mariadb://mariadb:3306/ktor_db
+      DB_DRIVER: org.mariadb.jdbc.Driver
+      DB_USER: ktor_user
+      DB_PASSWORD: ktor_pass
+      JWT_SECRET: super_secret_key
+      JWT_ISSUER: domain.com
+      JWT_AUDIENCE: ktor_audience
+      JWT_REALM: ktor_realm
+    ports:
+      - "8080:8080"
+
   mariadb:
     image: mariadb:11.8
     container_name: ktor_mariadb

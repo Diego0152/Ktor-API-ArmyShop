@@ -4,7 +4,7 @@ API en Ktor con CRUD de `usuarios`, `armas` y `anuncios`, persistencia en MariaD
 
 La API usa autenticación por token: para acceder a los endpoints de negocio debes estar logueado y enviar un token válido.
 
-## Levantar base de datos y administrador
+## Levantar stack completo (API + MariaDB + Adminer)
 
 1. Levanta los contenedores:
 
@@ -12,21 +12,29 @@ La API usa autenticación por token: para acceder a los endpoints de negocio deb
 docker compose up -d
 ```
 
-2. Adminer quedará disponible en:
+2. La API quedará disponible en:
+
+```text
+http://localhost:8080
+```
+
+3. Adminer quedará disponible en:
 
 ```text
 http://localhost:8081
 ```
 
-3. Datos de conexión de Adminer:
+4. Datos de conexión de Adminer:
 
 - System: `MariaDB`
-- Server: `mariadb`
+- Server: `127.0.0.1`
 - Username: `ktor_user`
 - Password: `ktor_pass`
 - Database: `ktor_db`
 
-## Configurar la API
+Si usas Adminer desde otro contenedor de la misma red Docker, el server sí sería `mariadb`.
+
+## Configurar la API (modo local sin Docker)
 
 Puedes copiar `.env.example` a `.env` y ajustar valores. Variables usadas por la app:
 
@@ -37,7 +45,7 @@ Puedes copiar `.env.example` a `.env` y ajustar valores. Variables usadas por la
 
 Si no defines variables, la app usa H2 en memoria como fallback (útil para tests/desarrollo rápido).
 
-## Ejecutar
+## Ejecutar en local
 
 ```bash
 ./gradlew run

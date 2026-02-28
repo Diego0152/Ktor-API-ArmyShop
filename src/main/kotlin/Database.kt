@@ -3,9 +3,13 @@ package com.example
 import com.zaxxer.hikari.HikariConfig
 import com.zaxxer.hikari.HikariDataSource
 import io.ktor.http.HttpStatusCode
+import io.ktor.http.auth.HttpAuthHeader
 import io.ktor.server.application.Application
 import io.ktor.server.application.ApplicationCall
 import io.ktor.server.application.call
+import io.ktor.server.auth.authenticate
+import io.ktor.server.auth.principal
+import io.ktor.server.auth.jwt.JWTPrincipal
 import io.ktor.server.request.receive
 import io.ktor.server.response.respond
 import io.ktor.server.routing.Route
@@ -28,8 +32,7 @@ import org.jetbrains.exposed.sql.selectAll
 import org.jetbrains.exposed.sql.transactions.transaction
 import org.jetbrains.exposed.sql.update
 import io.ktor.server.request.header
-import io.ktor.util.AttributeKey
-import io.ktor.server.application.createRouteScopedPlugin
+import org.mindrot.jbcrypt.BCrypt
 import java.util.UUID
 
 fun Application.configureDatabases() {
@@ -54,6 +57,12 @@ fun Application.configureDatabases() {
 
     transaction {
         SchemaUtils.create(Usuarios, Armas, Anuncios)
+
+        if (jdbcUrl.startsWith("jdbc:mariadb:", ignoreCase = true)) {
+            runCatching {
+                exec("ALTER TABLE usuarios MODIFY COLUMN imagen LONGTEXT NULL")
+            }
+        }
     }
 }
 
@@ -61,7 +70,7 @@ object Usuarios : Table("usuarios") {
     val idUsuario = integer("idUsuario").autoIncrement()
     val nombreUsuario = varchar("nombre_usuario", 120)
     val contrasena = varchar("contrasena", 255)
-    val imagen = varchar("imagen", 500).nullable()
+    val imagen = text("imagen").nullable()
     val email = varchar("email", 200)
     val rol = varchar("rol", 50)
     val activo = bool("activo").default(true)
@@ -257,6 +266,22 @@ private fun UsuarioResponse.toPublicResponse(): UsuarioPublicResponse = UsuarioP
     activo = activo,
 )
 
+private object PasswordSecurity {
+    fun hashPassword(rawPassword: String): String = BCrypt.hashpw(rawPassword, BCrypt.gensalt())
+
+    fun isBcryptHash(value: String): Boolean {
+        return value.startsWith("$2a$") || value.startsWith("$2b$") || value.startsWith("$2y$")
+    }
+
+    fun verifyPassword(rawPassword: String, storedPassword: String): Boolean {
+        return if (isBcryptHash(storedPassword)) {
+            BCrypt.checkpw(rawPassword, storedPassword)
+        } else {
+            rawPassword == storedPassword
+        }
+    }
+}
+
 private object UsuarioRepository {
     fun getAll(): List<UsuarioResponse> = transaction {
         Usuarios.selectAll().map { it.toUsuarioResponse() }
@@ -267,9 +292,10 @@ private object UsuarioRepository {
     }
 
     fun create(payload: UsuarioCreateRequest): UsuarioResponse = transaction {
+        val hashedPassword = PasswordSecurity.hashPassword(payload.contrasena)
         val id = Usuarios.insert {
             it[nombreUsuario] = payload.nombreUsuario
-            it[contrasena] = payload.contrasena
+            it[contrasena] = hashedPassword
             it[imagen] = payload.imagen
             it[email] = payload.email
             it[rol] = payload.rol
@@ -289,11 +315,12 @@ private object UsuarioRepository {
             throw IllegalArgumentException("El nombre de usuario o email ya existe")
         }
 
+        val hashedPassword = PasswordSecurity.hashPassword(payload.contrasena)
         val generatedToken = UUID.randomUUID().toString()
 
         val id = Usuarios.insert {
             it[nombreUsuario] = payload.nombreUsuario
-            it[contrasena] = payload.contrasena
+            it[contrasena] = hashedPassword
             it[imagen] = payload.imagen
             it[email] = payload.email
             it[rol] = payload.rol
@@ -307,18 +334,31 @@ private object UsuarioRepository {
     fun login(nombre: String, password: String): UsuarioResponse? = transaction {
         val usuario = Usuarios.selectAll().where {
             (Usuarios.nombreUsuario eq nombre) and
-                (Usuarios.contrasena eq password) and
                 (Usuarios.activo eq true)
         }.singleOrNull()?.toUsuarioResponse() ?: return@transaction null
 
-        if (!usuario.token.isNullOrBlank()) return@transaction usuario
+        if (!PasswordSecurity.verifyPassword(password, usuario.contrasena)) {
+            return@transaction null
+        }
+
+        var resultUsuario = usuario
+
+        if (!PasswordSecurity.isBcryptHash(usuario.contrasena)) {
+            val hashedPassword = PasswordSecurity.hashPassword(password)
+            Usuarios.update({ Usuarios.idUsuario eq usuario.idUsuario }) {
+                it[contrasena] = hashedPassword
+            }
+            resultUsuario = resultUsuario.copy(contrasena = hashedPassword)
+        }
+
+        if (!resultUsuario.token.isNullOrBlank()) return@transaction resultUsuario
 
         val generatedToken = UUID.randomUUID().toString()
-        Usuarios.update({ Usuarios.idUsuario eq usuario.idUsuario }) {
+        Usuarios.update({ Usuarios.idUsuario eq resultUsuario.idUsuario }) {
             it[token] = generatedToken
         }
 
-        usuario.copy(token = generatedToken)
+        resultUsuario.copy(token = generatedToken)
     }
 
     fun getByToken(token: String): UsuarioResponse? = transaction {
@@ -331,10 +371,19 @@ private object UsuarioRepository {
         } > 0
     }
 
+    fun isTokenActive(id: Int, tokenId: String): Boolean = transaction {
+        Usuarios.selectAll().where {
+            (Usuarios.idUsuario eq id) and
+                (Usuarios.token eq tokenId) and
+                (Usuarios.activo eq true)
+        }.singleOrNull() != null
+    }
+
     fun update(id: Int, payload: UsuarioUpdateRequest): Boolean = transaction {
+        val hashedPassword = PasswordSecurity.hashPassword(payload.contrasena)
         Usuarios.update({ Usuarios.idUsuario eq id }) {
             it[nombreUsuario] = payload.nombreUsuario
-            it[contrasena] = payload.contrasena
+            it[contrasena] = hashedPassword
             it[imagen] = payload.imagen
             it[email] = payload.email
             it[rol] = payload.rol
@@ -348,40 +397,29 @@ private object UsuarioRepository {
     }
 }
 
-private val AuthenticatedUserIdKey = AttributeKey<Int>("authenticatedUserId")
+fun isActiveJwtToken(userId: Int, tokenId: String): Boolean {
+    return UsuarioRepository.isTokenActive(userId, tokenId)
+}
 
-private fun ApplicationCall.extractTokenFromHeaders(): String? {
+private fun buildAuthResponse(application: Application, usuario: UsuarioResponse): AuthResponse {
+    val tokenId = usuario.token ?: error("El usuario no tiene token activo")
+    val jwtToken = JwtConfig.generateToken(application, usuario.idUsuario, usuario.nombreUsuario, tokenId)
+    return AuthResponse(token = jwtToken, usuario = usuario.toPublicResponse())
+}
+
+private fun ApplicationCall.extractJwtTokenFromHeaders(): String? {
     val authorization = request.header("Authorization")
-    val bearerToken = authorization
+    val authHeader = authorization
         ?.takeIf { it.startsWith("Bearer ", ignoreCase = true) }
         ?.substringAfter("Bearer ")
         ?.trim()
-    val rawToken = request.header("X-Auth-Token")?.trim()
-
-    return bearerToken?.takeIf { it.isNotEmpty() } ?: rawToken?.takeIf { it.isNotEmpty() }
-}
-
-private suspend fun ApplicationCall.requireAuthenticatedUserOrRespond(): UsuarioResponse? {
-    val token = extractTokenFromHeaders()
-    if (token == null) {
-        respond(HttpStatusCode.Unauthorized, "Token requerido")
-        return null
-    }
-
-    val usuario = UsuarioRepository.getByToken(token)
-    if (usuario == null || !usuario.activo) {
-        respond(HttpStatusCode.Unauthorized, "Token inválido")
-        return null
-    }
-
-    attributes.put(AuthenticatedUserIdKey, usuario.idUsuario)
-    return usuario
-}
-
-private val TokenAuthPlugin = createRouteScopedPlugin(name = "TokenAuthPlugin") {
-    onCall { call ->
-        call.requireAuthenticatedUserOrRespond() ?: return@onCall
-    }
+        ?.takeIf { it.isNotEmpty() }
+        ?.let { HttpAuthHeader.Single("Bearer", it) }
+        ?: request.header("X-Auth-Token")
+            ?.trim()
+            ?.takeIf { it.isNotEmpty() }
+            ?.let { HttpAuthHeader.Single("Bearer", it) }
+    return JwtConfig.extractTokenFromHeaders(authHeader)
 }
 
 private object ArmaRepository {
@@ -477,10 +515,7 @@ fun Route.apiRoutes() {
                     val usuario = UsuarioRepository.register(payload)
                     call.respond(
                         HttpStatusCode.Created,
-                        AuthResponse(
-                            token = usuario.token.orEmpty(),
-                            usuario = usuario.toPublicResponse(),
-                        ),
+                        buildAuthResponse(call.application, usuario),
                     )
                 } catch (exception: IllegalArgumentException) {
                     call.respond(HttpStatusCode.BadRequest, exception.message ?: "Datos inválidos")
@@ -494,21 +529,28 @@ fun Route.apiRoutes() {
 
                 call.respond(
                     HttpStatusCode.OK,
-                    AuthResponse(
-                        token = usuario.token.orEmpty(),
-                        usuario = usuario.toPublicResponse(),
-                    ),
+                    buildAuthResponse(call.application, usuario),
                 )
             }
 
             get("/validate") {
-                val token = call.extractTokenFromHeaders()
+                val token = call.extractJwtTokenFromHeaders()
 
                 if (token == null) {
                     return@get call.respond(HttpStatusCode.Unauthorized, TokenValidationResponse(valido = false))
                 }
 
-                val usuario = UsuarioRepository.getByToken(token)
+                val decoded = JwtConfig.verifyToken(call.application, token)
+                    ?: return@get call.respond(HttpStatusCode.Unauthorized, TokenValidationResponse(valido = false))
+
+                val userId = decoded.getClaim("idUsuario").asInt()
+                val tokenId = decoded.getClaim("tokenId").asString()
+
+                if (userId == null || tokenId.isNullOrBlank() || !isActiveJwtToken(userId, tokenId)) {
+                    return@get call.respond(HttpStatusCode.Unauthorized, TokenValidationResponse(valido = false))
+                }
+
+                val usuario = UsuarioRepository.getById(userId)
                 if (usuario == null || !usuario.activo) {
                     return@get call.respond(HttpStatusCode.Unauthorized, TokenValidationResponse(valido = false))
                 }
@@ -516,156 +558,166 @@ fun Route.apiRoutes() {
                 call.respond(TokenValidationResponse(valido = true, usuario = usuario.toPublicResponse()))
             }
 
-            get("/me") {
-                val usuario = call.requireAuthenticatedUserOrRespond() ?: return@get
+            authenticate("auth-jwt") {
+                get("/me") {
+                    val principal = call.principal<JWTPrincipal>()
+                        ?: return@get call.respond(HttpStatusCode.Unauthorized)
+                    val userId = principal.payload.getClaim("idUsuario").asInt()
+                        ?: return@get call.respond(HttpStatusCode.Unauthorized)
+                    val usuario = UsuarioRepository.getById(userId)
+                        ?: return@get call.respond(HttpStatusCode.Unauthorized)
 
-                call.respond(usuario.toPublicResponse())
-            }
+                    call.respond(usuario.toPublicResponse())
+                }
 
-            post("/logout") {
-                val usuario = call.requireAuthenticatedUserOrRespond() ?: return@post
-                UsuarioRepository.clearToken(usuario.idUsuario)
-                call.respond(HttpStatusCode.OK)
-            }
-        }
+                post("/logout") {
+                    val principal = call.principal<JWTPrincipal>()
+                        ?: return@post call.respond(HttpStatusCode.Unauthorized)
+                    val userId = principal.payload.getClaim("idUsuario").asInt()
+                        ?: return@post call.respond(HttpStatusCode.Unauthorized)
 
-        route("/usuarios") {
-            install(TokenAuthPlugin)
-
-            get {
-                call.respond(UsuarioRepository.getAll())
-            }
-
-            get("/{id}") {
-                val id = call.parameters["id"]?.toIntOrNull()
-                    ?: return@get call.respond(HttpStatusCode.BadRequest, "Id inválido")
-
-                val item = UsuarioRepository.getById(id)
-                    ?: return@get call.respond(HttpStatusCode.NotFound, "Usuario no encontrado")
-
-                call.respond(item)
-            }
-
-            post {
-                val payload = call.receive<UsuarioCreateRequest>()
-                call.respond(HttpStatusCode.Created, UsuarioRepository.create(payload))
-            }
-
-            put("/{id}") {
-                val id = call.parameters["id"]?.toIntOrNull()
-                    ?: return@put call.respond(HttpStatusCode.BadRequest, "Id inválido")
-
-                val payload = call.receive<UsuarioUpdateRequest>()
-                val updated = UsuarioRepository.update(id, payload)
-
-                if (!updated) call.respond(HttpStatusCode.NotFound, "Usuario no encontrado")
-                else call.respond(HttpStatusCode.OK)
-            }
-
-            delete("/{id}") {
-                val id = call.parameters["id"]?.toIntOrNull()
-                    ?: return@delete call.respond(HttpStatusCode.BadRequest, "Id inválido")
-
-                val deleted = UsuarioRepository.delete(id)
-
-                if (!deleted) call.respond(HttpStatusCode.NotFound, "Usuario no encontrado")
-                else call.respond(HttpStatusCode.NoContent)
+                    UsuarioRepository.clearToken(userId)
+                    call.respond(HttpStatusCode.OK)
+                }
             }
         }
 
-        route("/armas") {
-            install(TokenAuthPlugin)
+        authenticate("auth-jwt") {
+            route("/usuarios") {
 
-            get {
-                call.respond(ArmaRepository.getAll())
-            }
+                get {
+                    call.respond(UsuarioRepository.getAll())
+                }
 
-            get("/{id}") {
-                val id = call.parameters["id"]?.toIntOrNull()
-                    ?: return@get call.respond(HttpStatusCode.BadRequest, "Id inválido")
+                get("/{id}") {
+                    val id = call.parameters["id"]?.toIntOrNull()
+                        ?: return@get call.respond(HttpStatusCode.BadRequest, "Id inválido")
 
-                val item = ArmaRepository.getById(id)
-                    ?: return@get call.respond(HttpStatusCode.NotFound, "Arma no encontrada")
+                    val item = UsuarioRepository.getById(id)
+                        ?: return@get call.respond(HttpStatusCode.NotFound, "Usuario no encontrado")
 
-                call.respond(item)
-            }
+                    call.respond(item)
+                }
 
-            post {
-                val payload = call.receive<ArmaCreateRequest>()
-                try {
-                    call.respond(HttpStatusCode.Created, ArmaRepository.create(payload))
-                } catch (exception: IllegalArgumentException) {
-                    call.respond(HttpStatusCode.BadRequest, exception.message ?: "Datos inválidos")
+                post {
+                    val payload = call.receive<UsuarioCreateRequest>()
+                    call.respond(HttpStatusCode.Created, UsuarioRepository.create(payload))
+                }
+
+                put("/{id}") {
+                    val id = call.parameters["id"]?.toIntOrNull()
+                        ?: return@put call.respond(HttpStatusCode.BadRequest, "Id inválido")
+
+                    val payload = call.receive<UsuarioUpdateRequest>()
+                    val updated = UsuarioRepository.update(id, payload)
+
+                    if (!updated) call.respond(HttpStatusCode.NotFound, "Usuario no encontrado")
+                    else call.respond(HttpStatusCode.OK)
+                }
+
+                delete("/{id}") {
+                    val id = call.parameters["id"]?.toIntOrNull()
+                        ?: return@delete call.respond(HttpStatusCode.BadRequest, "Id inválido")
+
+                    val deleted = UsuarioRepository.delete(id)
+
+                    if (!deleted) call.respond(HttpStatusCode.NotFound, "Usuario no encontrado")
+                    else call.respond(HttpStatusCode.NoContent)
                 }
             }
 
-            put("/{id}") {
-                val id = call.parameters["id"]?.toIntOrNull()
-                    ?: return@put call.respond(HttpStatusCode.BadRequest, "Id inválido")
+            route("/armas") {
 
-                val payload = call.receive<ArmaUpdateRequest>()
-                val updated = try {
-                    ArmaRepository.update(id, payload)
-                } catch (exception: IllegalArgumentException) {
-                    return@put call.respond(HttpStatusCode.BadRequest, exception.message ?: "Datos inválidos")
+                get {
+                    call.respond(ArmaRepository.getAll())
                 }
 
-                if (!updated) call.respond(HttpStatusCode.NotFound, "Arma no encontrada")
-                else call.respond(HttpStatusCode.OK)
+                get("/{id}") {
+                    val id = call.parameters["id"]?.toIntOrNull()
+                        ?: return@get call.respond(HttpStatusCode.BadRequest, "Id inválido")
+
+                    val item = ArmaRepository.getById(id)
+                        ?: return@get call.respond(HttpStatusCode.NotFound, "Arma no encontrada")
+
+                    call.respond(item)
+                }
+
+                post {
+                    val payload = call.receive<ArmaCreateRequest>()
+                    try {
+                        call.respond(HttpStatusCode.Created, ArmaRepository.create(payload))
+                    } catch (exception: IllegalArgumentException) {
+                        call.respond(HttpStatusCode.BadRequest, exception.message ?: "Datos inválidos")
+                    }
+                }
+
+                put("/{id}") {
+                    val id = call.parameters["id"]?.toIntOrNull()
+                        ?: return@put call.respond(HttpStatusCode.BadRequest, "Id inválido")
+
+                    val payload = call.receive<ArmaUpdateRequest>()
+                    val updated = try {
+                        ArmaRepository.update(id, payload)
+                    } catch (exception: IllegalArgumentException) {
+                        return@put call.respond(HttpStatusCode.BadRequest, exception.message ?: "Datos inválidos")
+                    }
+
+                    if (!updated) call.respond(HttpStatusCode.NotFound, "Arma no encontrada")
+                    else call.respond(HttpStatusCode.OK)
+                }
+
+                delete("/{id}") {
+                    val id = call.parameters["id"]?.toIntOrNull()
+                        ?: return@delete call.respond(HttpStatusCode.BadRequest, "Id inválido")
+
+                    val deleted = ArmaRepository.delete(id)
+
+                    if (!deleted) call.respond(HttpStatusCode.NotFound, "Arma no encontrada")
+                    else call.respond(HttpStatusCode.NoContent)
+                }
             }
 
-            delete("/{id}") {
-                val id = call.parameters["id"]?.toIntOrNull()
-                    ?: return@delete call.respond(HttpStatusCode.BadRequest, "Id inválido")
+            route("/anuncios") {
 
-                val deleted = ArmaRepository.delete(id)
+                get {
+                    call.respond(AnuncioRepository.getAll())
+                }
 
-                if (!deleted) call.respond(HttpStatusCode.NotFound, "Arma no encontrada")
-                else call.respond(HttpStatusCode.NoContent)
-            }
-        }
+                get("/{id}") {
+                    val id = call.parameters["id"]?.toIntOrNull()
+                        ?: return@get call.respond(HttpStatusCode.BadRequest, "Id inválido")
 
-        route("/anuncios") {
-            install(TokenAuthPlugin)
+                    val item = AnuncioRepository.getById(id)
+                        ?: return@get call.respond(HttpStatusCode.NotFound, "Anuncio no encontrado")
 
-            get {
-                call.respond(AnuncioRepository.getAll())
-            }
+                    call.respond(item)
+                }
 
-            get("/{id}") {
-                val id = call.parameters["id"]?.toIntOrNull()
-                    ?: return@get call.respond(HttpStatusCode.BadRequest, "Id inválido")
+                post {
+                    val payload = call.receive<AnuncioCreateRequest>()
+                    call.respond(HttpStatusCode.Created, AnuncioRepository.create(payload))
+                }
 
-                val item = AnuncioRepository.getById(id)
-                    ?: return@get call.respond(HttpStatusCode.NotFound, "Anuncio no encontrado")
+                put("/{id}") {
+                    val id = call.parameters["id"]?.toIntOrNull()
+                        ?: return@put call.respond(HttpStatusCode.BadRequest, "Id inválido")
 
-                call.respond(item)
-            }
+                    val payload = call.receive<AnuncioUpdateRequest>()
+                    val updated = AnuncioRepository.update(id, payload)
 
-            post {
-                val payload = call.receive<AnuncioCreateRequest>()
-                call.respond(HttpStatusCode.Created, AnuncioRepository.create(payload))
-            }
+                    if (!updated) call.respond(HttpStatusCode.NotFound, "Anuncio no encontrado")
+                    else call.respond(HttpStatusCode.OK)
+                }
 
-            put("/{id}") {
-                val id = call.parameters["id"]?.toIntOrNull()
-                    ?: return@put call.respond(HttpStatusCode.BadRequest, "Id inválido")
+                delete("/{id}") {
+                    val id = call.parameters["id"]?.toIntOrNull()
+                        ?: return@delete call.respond(HttpStatusCode.BadRequest, "Id inválido")
 
-                val payload = call.receive<AnuncioUpdateRequest>()
-                val updated = AnuncioRepository.update(id, payload)
+                    val deleted = AnuncioRepository.delete(id)
 
-                if (!updated) call.respond(HttpStatusCode.NotFound, "Anuncio no encontrado")
-                else call.respond(HttpStatusCode.OK)
-            }
-
-            delete("/{id}") {
-                val id = call.parameters["id"]?.toIntOrNull()
-                    ?: return@delete call.respond(HttpStatusCode.BadRequest, "Id inválido")
-
-                val deleted = AnuncioRepository.delete(id)
-
-                if (!deleted) call.respond(HttpStatusCode.NotFound, "Anuncio no encontrado")
-                else call.respond(HttpStatusCode.NoContent)
+                    if (!deleted) call.respond(HttpStatusCode.NotFound, "Anuncio no encontrado")
+                    else call.respond(HttpStatusCode.NoContent)
+                }
             }
         }
     }
