@@ -4,6 +4,7 @@ import com.zaxxer.hikari.HikariConfig
 import com.zaxxer.hikari.HikariDataSource
 import io.ktor.http.HttpStatusCode
 import io.ktor.server.application.Application
+import io.ktor.server.application.ApplicationCall
 import io.ktor.server.application.call
 import io.ktor.server.request.receive
 import io.ktor.server.response.respond
@@ -17,13 +18,19 @@ import kotlinx.serialization.Serializable
 import org.jetbrains.exposed.sql.Database
 import org.jetbrains.exposed.sql.ResultRow
 import org.jetbrains.exposed.sql.SchemaUtils
+import org.jetbrains.exposed.sql.and
 import org.jetbrains.exposed.sql.SqlExpressionBuilder.eq
 import org.jetbrains.exposed.sql.Table
 import org.jetbrains.exposed.sql.deleteWhere
 import org.jetbrains.exposed.sql.insert
+import org.jetbrains.exposed.sql.or
 import org.jetbrains.exposed.sql.selectAll
 import org.jetbrains.exposed.sql.transactions.transaction
 import org.jetbrains.exposed.sql.update
+import io.ktor.server.request.header
+import io.ktor.util.AttributeKey
+import io.ktor.server.application.createRouteScopedPlugin
+import java.util.UUID
 
 fun Application.configureDatabases() {
     val config = environment.config
@@ -120,6 +127,43 @@ data class UsuarioResponse(
 )
 
 @Serializable
+data class UsuarioPublicResponse(
+    val idUsuario: Int,
+    val nombreUsuario: String,
+    val imagen: String?,
+    val email: String,
+    val rol: String,
+    val activo: Boolean,
+)
+
+@Serializable
+data class LoginRequest(
+    val nombreUsuario: String,
+    val contrasena: String,
+)
+
+@Serializable
+data class RegisterRequest(
+    val nombreUsuario: String,
+    val contrasena: String,
+    val imagen: String? = null,
+    val email: String,
+    val rol: String = "cliente",
+)
+
+@Serializable
+data class AuthResponse(
+    val token: String,
+    val usuario: UsuarioPublicResponse,
+)
+
+@Serializable
+data class TokenValidationResponse(
+    val valido: Boolean,
+    val usuario: UsuarioPublicResponse? = null,
+)
+
+@Serializable
 data class ArmaCreateRequest(
     val nombre: String,
     val categoria: String,
@@ -204,6 +248,15 @@ private fun ResultRow.toAnuncioResponse(): AnuncioResponse = AnuncioResponse(
     imagen = this[Anuncios.imagen],
 )
 
+private fun UsuarioResponse.toPublicResponse(): UsuarioPublicResponse = UsuarioPublicResponse(
+    idUsuario = idUsuario,
+    nombreUsuario = nombreUsuario,
+    imagen = imagen,
+    email = email,
+    rol = rol,
+    activo = activo,
+)
+
 private object UsuarioRepository {
     fun getAll(): List<UsuarioResponse> = transaction {
         Usuarios.selectAll().map { it.toUsuarioResponse() }
@@ -227,6 +280,57 @@ private object UsuarioRepository {
         Usuarios.selectAll().where { Usuarios.idUsuario eq id }.single().toUsuarioResponse()
     }
 
+    fun register(payload: RegisterRequest): UsuarioResponse = transaction {
+        val exists = Usuarios.selectAll().where {
+            (Usuarios.nombreUsuario eq payload.nombreUsuario) or (Usuarios.email eq payload.email)
+        }.singleOrNull() != null
+
+        if (exists) {
+            throw IllegalArgumentException("El nombre de usuario o email ya existe")
+        }
+
+        val generatedToken = UUID.randomUUID().toString()
+
+        val id = Usuarios.insert {
+            it[nombreUsuario] = payload.nombreUsuario
+            it[contrasena] = payload.contrasena
+            it[imagen] = payload.imagen
+            it[email] = payload.email
+            it[rol] = payload.rol
+            it[activo] = true
+            it[token] = generatedToken
+        }[Usuarios.idUsuario]
+
+        Usuarios.selectAll().where { Usuarios.idUsuario eq id }.single().toUsuarioResponse()
+    }
+
+    fun login(nombre: String, password: String): UsuarioResponse? = transaction {
+        val usuario = Usuarios.selectAll().where {
+            (Usuarios.nombreUsuario eq nombre) and
+                (Usuarios.contrasena eq password) and
+                (Usuarios.activo eq true)
+        }.singleOrNull()?.toUsuarioResponse() ?: return@transaction null
+
+        if (!usuario.token.isNullOrBlank()) return@transaction usuario
+
+        val generatedToken = UUID.randomUUID().toString()
+        Usuarios.update({ Usuarios.idUsuario eq usuario.idUsuario }) {
+            it[token] = generatedToken
+        }
+
+        usuario.copy(token = generatedToken)
+    }
+
+    fun getByToken(token: String): UsuarioResponse? = transaction {
+        Usuarios.selectAll().where { Usuarios.token eq token }.singleOrNull()?.toUsuarioResponse()
+    }
+
+    fun clearToken(id: Int): Boolean = transaction {
+        Usuarios.update({ Usuarios.idUsuario eq id }) {
+            it[token] = null
+        } > 0
+    }
+
     fun update(id: Int, payload: UsuarioUpdateRequest): Boolean = transaction {
         Usuarios.update({ Usuarios.idUsuario eq id }) {
             it[nombreUsuario] = payload.nombreUsuario
@@ -241,6 +345,42 @@ private object UsuarioRepository {
 
     fun delete(id: Int): Boolean = transaction {
         Usuarios.deleteWhere { Usuarios.idUsuario eq id } > 0
+    }
+}
+
+private val AuthenticatedUserIdKey = AttributeKey<Int>("authenticatedUserId")
+
+private fun ApplicationCall.extractTokenFromHeaders(): String? {
+    val authorization = request.header("Authorization")
+    val bearerToken = authorization
+        ?.takeIf { it.startsWith("Bearer ", ignoreCase = true) }
+        ?.substringAfter("Bearer ")
+        ?.trim()
+    val rawToken = request.header("X-Auth-Token")?.trim()
+
+    return bearerToken?.takeIf { it.isNotEmpty() } ?: rawToken?.takeIf { it.isNotEmpty() }
+}
+
+private suspend fun ApplicationCall.requireAuthenticatedUserOrRespond(): UsuarioResponse? {
+    val token = extractTokenFromHeaders()
+    if (token == null) {
+        respond(HttpStatusCode.Unauthorized, "Token requerido")
+        return null
+    }
+
+    val usuario = UsuarioRepository.getByToken(token)
+    if (usuario == null || !usuario.activo) {
+        respond(HttpStatusCode.Unauthorized, "Token inválido")
+        return null
+    }
+
+    attributes.put(AuthenticatedUserIdKey, usuario.idUsuario)
+    return usuario
+}
+
+private val TokenAuthPlugin = createRouteScopedPlugin(name = "TokenAuthPlugin") {
+    onCall { call ->
+        call.requireAuthenticatedUserOrRespond() ?: return@onCall
     }
 }
 
@@ -329,8 +469,69 @@ private object AnuncioRepository {
 }
 
 fun Route.apiRoutes() {
-    route("/api/v1") {
+    route("/api/v2") {
+        route("/auth") {
+            post("/register") {
+                try {
+                    val payload = call.receive<RegisterRequest>()
+                    val usuario = UsuarioRepository.register(payload)
+                    call.respond(
+                        HttpStatusCode.Created,
+                        AuthResponse(
+                            token = usuario.token.orEmpty(),
+                            usuario = usuario.toPublicResponse(),
+                        ),
+                    )
+                } catch (exception: IllegalArgumentException) {
+                    call.respond(HttpStatusCode.BadRequest, exception.message ?: "Datos inválidos")
+                }
+            }
+
+            post("/login") {
+                val payload = call.receive<LoginRequest>()
+                val usuario = UsuarioRepository.login(payload.nombreUsuario, payload.contrasena)
+                    ?: return@post call.respond(HttpStatusCode.Unauthorized, "Credenciales inválidas")
+
+                call.respond(
+                    HttpStatusCode.OK,
+                    AuthResponse(
+                        token = usuario.token.orEmpty(),
+                        usuario = usuario.toPublicResponse(),
+                    ),
+                )
+            }
+
+            get("/validate") {
+                val token = call.extractTokenFromHeaders()
+
+                if (token == null) {
+                    return@get call.respond(HttpStatusCode.Unauthorized, TokenValidationResponse(valido = false))
+                }
+
+                val usuario = UsuarioRepository.getByToken(token)
+                if (usuario == null || !usuario.activo) {
+                    return@get call.respond(HttpStatusCode.Unauthorized, TokenValidationResponse(valido = false))
+                }
+
+                call.respond(TokenValidationResponse(valido = true, usuario = usuario.toPublicResponse()))
+            }
+
+            get("/me") {
+                val usuario = call.requireAuthenticatedUserOrRespond() ?: return@get
+
+                call.respond(usuario.toPublicResponse())
+            }
+
+            post("/logout") {
+                val usuario = call.requireAuthenticatedUserOrRespond() ?: return@post
+                UsuarioRepository.clearToken(usuario.idUsuario)
+                call.respond(HttpStatusCode.OK)
+            }
+        }
+
         route("/usuarios") {
+            install(TokenAuthPlugin)
+
             get {
                 call.respond(UsuarioRepository.getAll())
             }
@@ -373,6 +574,8 @@ fun Route.apiRoutes() {
         }
 
         route("/armas") {
+            install(TokenAuthPlugin)
+
             get {
                 call.respond(ArmaRepository.getAll())
             }
@@ -423,6 +626,8 @@ fun Route.apiRoutes() {
         }
 
         route("/anuncios") {
+            install(TokenAuthPlugin)
+
             get {
                 call.respond(AnuncioRepository.getAll())
             }
